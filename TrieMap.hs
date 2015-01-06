@@ -8,18 +8,6 @@ import Debug.Trace
 import Control.Monad
 import Data.Maybe
 
--- General observation: when we do precise matching on a TrieMap, it's
--- not necesary to maintain enough information to reconstruct the keys
--- (so, e.g. if you have a 'Var' type with a lot of information, but
--- it's uniquely identified by an integer, you can convert it into an
--- IntMap.)
---
--- However, sometimes we want to build TrieMaps which can *reconstruct*
--- the keys (e.g. foldWithKeyTM).  This is especially necessary when
--- you do unifying matching on a TrieMap, because you need this
--- information to calculate a substitution.  Now you have to keep the
--- key around.
-
 -------------------------------------------------------------------------------
 -- TrieMap
 
@@ -36,7 +24,6 @@ class TrieMap m where
     lookupTM :: forall b. Key m -> m b -> Maybe b
     alterTM :: forall b. Key m -> XT b -> m b -> m b
     foldTM   :: (a -> b -> b) -> m a -> b -> b
-    foldWithKeyTM :: (Key m -> a -> b -> b) -> m a -> b -> b
 
 -- The unusual argument order here makes
 -- it easy to compose calls to foldTM;
@@ -72,9 +59,6 @@ deMaybe :: TrieMap m => Maybe (m a) -> m a
 deMaybe Nothing = emptyTM
 deMaybe (Just m) = m
 
-keysTM :: TrieMap m => m a -> [Key m]
-keysTM m = foldWithKeyTM (\k _ ks -> k:ks) m []
-
 -------------------------------------------------------------------------------
 -- Maybe
 
@@ -86,7 +70,6 @@ instance TrieMap m => TrieMap (MaybeMap m) where
    lookupTM = lkMaybe lookupTM
    alterTM  = xtMaybe alterTM
    foldTM   = fdMaybe
-   foldWithKeyTM = fdkMaybe
 
 wrapEmptyMaybeMap = MM { mm_nothing = Nothing, mm_just = emptyTM }
 
@@ -111,11 +94,6 @@ fdMaybe _ EmptyMM = \z -> z
 fdMaybe k m = foldMaybe k (mm_nothing m)
             . foldTM k (mm_just m)
 
-fdkMaybe :: TrieMap m => (Maybe (Key m) -> a -> b -> b) -> MaybeMap m a -> b -> b
-fdkMaybe _ EmptyMM = \z -> z
-fdkMaybe k m = foldMaybe (Nothing |> k) (mm_nothing m)
-             . foldWithKeyTM (Just >.> k) (mm_just m)
-
 foldMaybe :: (a -> b -> b) -> Maybe a -> b -> b
 foldMaybe _ Nothing  b = b
 foldMaybe k (Just a) b = k a b
@@ -133,7 +111,6 @@ instance TrieMap m => TrieMap (ListMap m) where
    lookupTM = lkList lookupTM
    alterTM  = xtList alterTM
    foldTM   = fdList
-   foldWithKeyTM = fdkList
 
 wrapEmptyListMap = LM { lm_nil = Nothing, lm_cons = emptyTM }
 
@@ -161,19 +138,6 @@ fdList _ EmptyLM = \z -> z
 fdList k m = foldMaybe k          (lm_nil m)
            . foldTM    (fdList k) (lm_cons m)
 
-fdkList :: TrieMap m => ([Key m] -> a -> b -> b) -> ListMap m a -> b -> b
-fdkList _ EmptyLM = \z -> z
-fdkList k m = foldMaybe ([] |> k) (lm_nil m)
-            . foldWithKeyTM (\v -> fdkList ((v:) >.> k)) (lm_cons m)
-
-fdkList' :: ((Key m -> ListMap m a -> b -> b) -> m (ListMap m a) -> b -> b)
-         -> ([Key m] -> a -> b -> b)
-         -> ListMap m a
-         -> b
-         -> b
-fdkList' fdk k m = foldMaybe ([] |> k) (lm_nil m)
-                 . fdk (\v -> fdkList' fdk ((v:) >.> k)) (lm_cons m)
-
 -------------------------------------------------------------------------------
 -- IntMap
 
@@ -183,7 +147,6 @@ instance TrieMap IntMap.IntMap where
     lookupTM k m = IntMap.lookup k m
     alterTM = xtInt
     foldTM k m z = IntMap.fold k z m
-    foldWithKeyTM k m z = IntMap.foldWithKey k z m
 
 xtInt :: Int -> XT a -> IntMap.IntMap a -> IntMap.IntMap a
 xtInt k f m = IntMap.alter f k m
@@ -197,7 +160,6 @@ instance Ord k => TrieMap (Map.Map k) where
   lookupTM = Map.lookup
   alterTM k f m = Map.alter f k m
   foldTM k m z = Map.fold k z m
-  foldWithKeyTM k m z = Map.foldWithKey k z m
 
 -------------------------------------------------------------------------------
 -- Unique
@@ -222,7 +184,6 @@ instance Uniquable k => TrieMap (UniqKM k) where
     lookupTM k m = lookupUKM m k
     alterTM k f m = alterUKM f m k
     foldTM k m z = foldUKM k z m
-    foldWithKeyTM k m z = foldWithKeyUKM k z m
 
 emptyUKM :: UniqKM k a
 emptyUKM = UKM M.empty
@@ -250,9 +211,6 @@ elemUKM_Directly u (UKM m) = M.member u m
 
 foldUKM :: (a -> r -> r) -> r -> UniqKM k a -> r
 foldUKM k z (UKM m) = M.fold (k . snd) z m
-
-foldWithKeyUKM :: (k -> a -> r -> r) -> r -> UniqKM k a -> r
-foldWithKeyUKM k z (UKM m) = M.fold (uncurry k) z m
 
 xtUKM :: Uniquable k => k -> XT a -> UniqKM k a -> UniqKM k a
 xtUKM k f m = alterUKM f m k
@@ -444,7 +402,6 @@ instance TrieMap VarMap where
    lookupTM = lkVar emptyCME
    alterTM  = xtVar emptyCME
    foldTM   = fdVar
-   foldWithKeyTM = fdkVar emptyCFE
 
 lkVar :: CmEnv -> Var -> VarMap a -> Maybe a
 lkVar env v
@@ -465,14 +422,6 @@ xtFreeVar v f m = alterVarEnv f m v
 fdVar :: (a -> b -> b) -> VarMap a -> b -> b
 fdVar k m = foldTM k (vm_bvar m)
           . foldTM k (vm_fvar m)
-
--- @bv@ specifies what 'Var' we should pull out for bound variables
--- when we're reifying the key, since our native representation is
--- not deBruijn numbered.
-fdkVar :: CfEnv -> (Var -> a -> b -> b) -> VarMap a -> b -> b
-fdkVar env k m
-    = foldWithKeyTM (\v -> maybe (error "fdkVar") k (lookupCFE env v)) (vm_bvar m)
-    . foldWithKeyTM k (vm_fvar m)
 
 -------------------------------------------------------------------------------
 -- TypeMap
@@ -495,7 +444,6 @@ instance TrieMap TypeMap where
    lookupTM = lkT emptyCME
    alterTM  = xtT emptyCME
    foldTM   = fdT
-   foldWithKeyTM = fdkT emptyCFE
 
 wrapEmptyTypeMap :: TypeMap a
 wrapEmptyTypeMap = TM { tm_var  = emptyTM
@@ -531,17 +479,6 @@ fdT k m = foldTM k (tm_var m)
         . foldTM (foldTM k) (tm_tc_app m)
         . foldTM (foldTM k) (tm_forall m)
         . foldMaybe k (tm_box m)
-
--- want in scope set
-fdkT :: CfEnv -> (Type -> a -> b -> b) -> TypeMap a -> b -> b
-fdkT _ _ EmptyTM = \z -> z
-fdkT env k m
-    = fdkVar env (TyVarTy >.> k) (tm_var m)
-    . foldWithKeyTM (\tc -> fdkList' (fdkT env) (TyConApp tc >.> k)) (tm_tc_app m)
-    . foldWithKeyTM (\tv ->
-        let (env', v) = extendCFE env tv
-        in fdkT env' (ForAllTy v >.> k)) (tm_forall m)
-    . foldMaybe (k TyBox) (tm_box m)
 
 -------------------------------------------------------------------------------
 -- BndrMap
@@ -693,7 +630,7 @@ matchT tmpls menv fenv subst t m
         -- substitution.  Accept all valid substitutions.
         | tv `elemVarSet` tmpls
         -- (\m -> trace (show (foldTM (const (+1)) m 0)) m) >.> 
-        = flip (fdkT fenv (\k x r -> (x, extendVarEnv subst tv k):r)) []
+        = undefined -- flip (fdkT fenv (\k x r -> (x, extendVarEnv subst tv k):r)) []
         -- TODO occurs check!!
         -- 3. It's just a plain old free variable.
         | otherwise
