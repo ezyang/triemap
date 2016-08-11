@@ -366,43 +366,76 @@ extendCMEs env vs = foldl extendCME env vs
 lookupCME :: CmEnv -> Var -> Maybe BoundVar
 lookupCME (CME { cme_env = env }) v = lookupVarEnv env v
 
--- Inverse of CmEnv (core "fold" environment)
--- This is VERY similar to rnEnv2, except since we're deBruijn indexed
--- we get to use BoundVarMap
-data CfEnv = CFE { cfe_next :: BoundVar
-                 , cfe_env :: BoundVarMap Var
-                 , cfe_in_scope :: InScopeSet
-                 }
+eqTypesModuloDeBruijn :: (CmEnv, [Type]) -> (CmEnv, [Type]) -> Bool
+eqTypesModuloDeBruijn (_, []) (_, []) = True
+eqTypesModuloDeBruijn (env, ty:tys) (env', ty':tys') =
+    eqTypeModuloDeBruijn (env, ty) (env', ty') &&
+    eqTypesModuloDeBruijn (env, tys) (env', tys')
+eqTypesModuloDeBruijn _ _ = False
+
+coreView _ = Nothing
+
+-- NB: need to coreView!
+eqTypeModuloDeBruijn :: (CmEnv, Type) -> (CmEnv, Type) -> Bool
+eqTypeModuloDeBruijn env_t@(env, t) env_t'@(env', t')
+    -- ToDo: I guess we can make this a little more efficient
+    | Just new_t  <- coreView t  = eqTypeModuloDeBruijn (env, new_t) env_t'
+    | Just new_t' <- coreView t' = eqTypeModuloDeBruijn env_t (env', new_t')
+eqTypeModuloDeBruijn (env, t) (env', t') =
+    case (t, t') of
+        (TyVarTy v, TyVarTy v')
+            -> case (lookupCME env v, lookupCME env' v') of
+                (Just bv, Just bv') -> bv == bv'
+                (Nothing, Nothing) -> v == v'
+                _ -> False
+        (TyConApp tc tys, TyConApp tc' tys')
+            -> tc == tc' && eqTypesModuloDeBruijn (env, tys) (env', tys')
+        (TyBox, TyBox)
+            -> True
+        (ForAllTy tv ty, ForAllTy tv' ty')
+            -> eqTypeModuloDeBruijn (env, tyVarKind tv) (env', tyVarKind tv') &&
+               eqTypeModuloDeBruijn (extendCME env tv, ty)
+                                    (extendCME env' tv', ty')
+        _ -> False
+
+{-
+
+data TmplEnv = TME { tme_next :: BoundVar
+                   , tme_env  :: VarEnv BoundVar
+                   , tme_vars :: [Var] }
     deriving (Show)
 
-emptyCFE :: CfEnv
-emptyCFE = CFE { cfe_next = 0, cfe_env = emptyBoundVarMap, cfe_in_scope = emptyInScopeSet }
+emptyTME :: TmplEnv
+emptyTME = TME { tme_next = 0, tme_env = emptyVarEnv, tme_vars = [] }
 
-extendCFE :: CfEnv -> Type -> (CfEnv, Var)
-extendCFE CFE { cfe_next = bv, cfe_env = env, cfe_in_scope = in_scope } tb
-    = (CFE { cfe_next = bv + 1
-           , cfe_env = extendBoundVarMap env bv new_b
-           , cfe_in_scope = extendInScopeSet in_scope new_b
-           }, new_b)
-          where new_b = uniqAway'' in_scope tb
+extendTME :: TmplEnv -> Var -> TmplEnv
+extendTME (CME { tme_next = bv, tme_env = env, tme_vars = vs }) v
+  = CME { cme_next = bv+1, cme_env = extendVarEnv env v bv, tme_vars = v:vs }
 
-lookupCFE :: CfEnv -> BoundVar -> Maybe Var
-lookupCFE env = lookupBoundVarMap (cfe_env env)
+extendCMEs :: TmplEnv -> [Var] -> TmplEnv
+extendCMEs env vs = foldl extendCME env vs
+
+
+lookupTmplEnv :: TmplEnv -> 
+
+-}
 
 -------------------------------------------------------------------------------
 -- VarMap
 
-data VarMap a = VM { vm_bvar   :: BoundVarMap a  -- Bound variable
-                   , vm_fvar   :: VarEnv a }      -- Free variable
+data VarMap a = VM { vm_bvar   :: BoundVarMap a   -- Bound variable
+                   , vm_fvar   :: VarEnv a        -- Free variable
+                   , vm_tvar   :: BoundVarMap a } -- Template variable
     deriving (Show)
 
 instance TrieMap VarMap where
    type Key VarMap = Var
-   emptyTM  = VM { vm_bvar = IntMap.empty, vm_fvar = emptyVarEnv }
+   emptyTM  = VM { vm_bvar = IntMap.empty, vm_fvar = emptyVarEnv, vm_tvar = IntMap.empty }
    lookupTM = lkVar emptyCME
    alterTM  = xtVar emptyCME
    foldTM   = fdVar
 
+-- NB: template variable is NEVER matched using lkVar/xtVar
 lkVar :: CmEnv -> Var -> VarMap a -> Maybe a
 lkVar env v
   | Just bv <- lookupCME env v = vm_bvar >.> lookupTM bv
@@ -422,6 +455,7 @@ xtFreeVar v f m = alterVarEnv f m v
 fdVar :: (a -> b -> b) -> VarMap a -> b -> b
 fdVar k m = foldTM k (vm_bvar m)
           . foldTM k (vm_fvar m)
+          . foldTM k (vm_tvar m)
 
 -------------------------------------------------------------------------------
 -- TypeMap
@@ -596,64 +630,63 @@ matchList _  _     _      _      = Nothing
 -------------------------------------------------------------------------------
 -- The BIG DADDY
 
-dmatchT :: VarSet -> Type -> TypeMap a -> [(a, TvSubstEnv)]
-dmatchT tmpls = matchT tmpls emptyCME emptyCFE emptyVarEnv
+type TmplSubstEnv = BoundVarMap Type
 
-matchT :: VarSet -> CmEnv -> CfEnv -> TvSubstEnv -> Type -> TypeMap a -> [(a, TvSubstEnv)]
-matchT tmpls menv fenv subst t m
+dmatchT :: Type -> TypeMap a -> [(a, TmplSubstEnv)] -- FIXME
+dmatchT = matchT emptyCME emptyBoundVarMap
+
+matchT :: CmEnv -> TmplSubstEnv -> Type -> TypeMap a -> [(a, TmplSubstEnv)]
+matchT menv subst t m
     | EmptyTM <- m = []
-    | otherwise = go t m
+    | otherwise = go t m ++ templateMatches
   where
+    -- So I want to do something like fold over the template variable
+    -- map, and check each of the indices against the current
+    -- substitution
+    templateMatches = IntMap.foldrWithKey templateMatch [] (vm_tvar (tm_var m))
+    templateMatch k v r
+        -- We've already substituted this template variable.
+        -- If they're equal, accept, otherwise, abort
+        | Just t' <- lookupBoundVarMap subst k
+        -- NB: t is guaranteed to not have any bound variables in it
+        = if eqTypeModuloDeBruijn (menv, t) (menv, t')
+            then (v, subst):r
+            else r
+        -- Nope, fresh template variable: accept the substitution.
+        -- TODO: occurs check, rule out bound variables
+        | otherwise
+        = (v, extendBoundVarMap subst k t):r
+
     accept = maybeToList >.> fmap (,subst)
     -- The original match strategy maintained a left/right renaming
     -- which it used to work around alpha-equivalence issues.  Our
-    -- strategy is to use on-the-fly deBruijn renaming.  However,
-    -- this means the order we check things is a bit delicate.
-    -- Suppose x is a template variable and we have \x. x. To process
-    -- the binder, we'll add x to CmEnv; then when we process the
-    -- variable x, x will be in both CmEnv and the set of template
-    -- variables: but it's NOT a template variable.
+    -- strategy is to use on-the-fly deBruijn renaming.
     --
     -- By the way, checking if lkVar returns Nothing is not good enough,
     -- since that just might mean that we didn't store anything for
     -- a bound variable; not that it isn't bound.  So we
-    -- semi-reimplement lkVar here
+    -- semi-reimplement lkVar here (TODO maybe better here)
     go (TyVarTy tv)
         | Just bv <- lookupCME menv tv
         = tm_var >.> vm_bvar >.> lookupTM bv >.> accept
-        -- OK, it's a free variable. A few possibilities...
-        -- 1. It's a template variable, AND we already have a
-        -- substitution for it.
-        | Just ty <- lookupVarEnv subst tv
-        = go ty
-        -- 2. It's a template variable, but we don't have a
-        -- substitution.  Accept all valid substitutions.
-        | tv `elemVarSet` tmpls
-        -- (\m -> trace (show (foldTM (const (+1)) m 0)) m) >.> 
-        = undefined -- flip (fdkT fenv (\k x r -> (x, extendVarEnv subst tv k):r)) []
-        -- TODO occurs check!!
-        -- 3. It's just a plain old free variable.
         | otherwise
         = tm_var >.> vm_fvar >.> lkFreeVar tv >.> accept
     go (ForAllTy tv ty)
         = tm_forall >.> lkBndr menv tv >.> maybeToList
-            >=> matchT tmpls
-                       (extendCME menv tv)
-                       (fst (extendCFE fenv (varType tv)))
-                       subst ty
+            >=> matchT (extendCME menv tv) subst ty
     go (TyConApp tc tys)
-        = tm_tc_app >.> lookupTM tc >.> maybeToList >=> matchListT tmpls menv fenv subst tys
+        = tm_tc_app >.> lookupTM tc >.> maybeToList >=> matchListT menv subst tys
     go TyBox = tm_box >.> accept
 
 -- BLAH, this should be generalized, but HOW... (the big problem is
--- threading the TvSubstEnv through)
-matchListT :: VarSet -> CmEnv -> CfEnv -> TvSubstEnv -> [Type] -> ListMap TypeMap a -> [(a, TvSubstEnv)]
-matchListT tmpls menv fenv subst ts m
+-- threading the TmplSubstEnv through)
+matchListT :: CmEnv -> TmplSubstEnv -> [Type] -> ListMap TypeMap a -> [(a, TmplSubstEnv)]
+matchListT menv subst ts m
     | EmptyLM <- m = []
     | otherwise = go subst ts m
   where
     go subst [] = lm_nil >.> maybeToList >.> fmap (,subst)
-    go subst (x:xs) = lm_cons >.> matchT tmpls menv fenv subst x
+    go subst (x:xs) = lm_cons >.> matchT menv subst x
                               >=> \(m', subst') -> go subst' xs m'
 
 -------------------------------------------------------------------------------
